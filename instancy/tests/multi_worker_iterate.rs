@@ -795,3 +795,79 @@ async fn staged_iterate_rejects_unequal_feedback_parallelism() {
         "error should mention cross-stage feedback: {err_msg}"
     );
 }
+
+
+/// Concern #4 (PR #280 review): a doubly-nested `iterate` with an exchange
+/// **inside the inner loop** would need to project in-flight messages onto the
+/// true outer epoch across BOTH scope levels. An unconsumed inner-loop exchange
+/// message has timestamp `Product<Product<u64, u32>, u32>`; the inner scope
+/// would project it onto its outer coordinate `Product<u64, u32>`, and the outer
+/// scope in turn onto the root epoch `u64`.
+///
+/// IGNORED — nested `iterate` is NOT currently supported, for a reason that is
+/// PRE-EXISTING and INDEPENDENT of this PR's #277 in-flight accounting fix.
+///
+/// ## Root cause (verified)
+///
+/// With two levels of `iterate`, materialization fails before any data flows,
+/// with `MissingFactory { edge_index: N }` ("missing factory for edge index N").
+/// `DataflowBuilder::iterate` builds the loop body in a nested `BuilderState`
+/// and merges it into the parent, re-indexing the body's exchange factory
+/// creators by `inner_edge_offset = parent.graph.edges().len()`
+/// (dataflow_builder.rs ~2740, ~2803). This single-level offset does not compose
+/// correctly through a second nesting level: the middle scope's already-offset
+/// exchange-creator edge indices are offset again by the outer merge and no
+/// longer line up with the flattened parent graph's edge numbering, so an
+/// exchange edge is left without a factory. This reproduces with an exchange in
+/// EITHER the inner OR the outer loop of a nested pair — it is a nested-scope
+/// edge-index composition bug, not specific to the inner-exchange projection.
+///
+/// Because materialization fails first, the single-level nature of the in-flight
+/// projection (`p.outer`, subgraph.rs `drain_inflight_projected`) is not even
+/// exercised here; fixing nested-scope materialization is a prerequisite and is
+/// out of scope for the #277 data-loss fix. Un-ignore once nested-scope exchange
+/// edge indexing composes correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "nested iterate with exchange is unsupported: nested-scope exchange \
+            edge-index composition bug in materialization; pre-existing and \
+            independent of the #277 fix"]
+async fn multi_worker_nested_iterate_inner_exchange() {
+    let results = run_multi_worker_iterate(
+        "mw-nested",
+        2,
+        |builder| {
+            let input = builder.input::<i64>("data").unwrap();
+            let output = input.iterate::<u32>("outer", 1u32, |outer_var| {
+                // Inner loop: add 1 (with redistribution) until a multiple of 5.
+                let inner_out = outer_var.iterate::<u32>("inner", 1u32, |inner_var| {
+                    let stepped = inner_var
+                        .map(
+                            "inner-add",
+                            |_t: &Product<Product<u64, u32>, u32>, x| x + 1,
+                        )
+                        .exchange_by_hash("inner-redist", |x: &i64| *x as u64);
+                    let done = stepped.clone().filter("inner-done", |_t, x| *x % 5 == 0);
+                    let again = stepped.filter("inner-again", |_t, x| *x % 5 != 0);
+                    IterateResult {
+                        feedback: again,
+                        output: done,
+                    }
+                });
+                // Outer loop: redistribute then continue until the value reaches 100.
+                let outer_stepped =
+                    inner_out.exchange_by_hash("outer-redist", |x: &i64| *x as u64);
+                let done = outer_stepped.clone().filter("outer-done", |_t, x| *x >= 100);
+                let again = outer_stepped.filter("outer-again", |_t, x| *x < 100);
+                IterateResult {
+                    feedback: again,
+                    output: done,
+                }
+            });
+            output.output("results").unwrap();
+        },
+        vec![(0, vec![1, 2, 3, 7, 50])],
+    )
+    .await;
+
+    assert_eq!(results, vec![100, 100, 100, 100, 100]);
+}

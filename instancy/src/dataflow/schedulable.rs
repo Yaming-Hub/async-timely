@@ -252,6 +252,52 @@ impl ChannelEndpoints {
             .inflight_by_target::<T>(operator, input)
     }
 
+    /// Wire the **producing** side of a boundary (exchange) edge: if an
+    /// in-flight reporter is registered for the edge sourced at
+    /// `(operator, output)`, attach it to `pusher` so every batch it sends
+    /// records `+count`.
+    ///
+    /// This is the single, canonical place to source an exchange's producing
+    /// side. Centralizing the lookup+attach in one call (instead of the two
+    /// separate steps at each operator factory) means the `set_inflight_reporter`
+    /// can't be forgotten after the lookup: forgetting the `+count` while the
+    /// consumer still records `-count` drives the in-flight net negative and
+    /// hangs the dataflow (the `iter_var.exchange` failure mode). Any future
+    /// exchange-sourcing operator factory should call this rather than re-deriving
+    /// the pattern. No-op for non-exchange outputs.
+    pub fn wire_inflight_source<T, D, M>(
+        &self,
+        operator: usize,
+        output: usize,
+        pusher: &mut (dyn crate::dataflow::channels::pushpull::Push<T, D, M> + '_),
+    ) where
+        T: crate::progress::timestamp::Timestamp,
+    {
+        if let Some(reporter) = self.inflight_reporter_by_source::<T>(operator, output) {
+            pusher.set_inflight_reporter(reporter);
+        }
+    }
+
+    /// Wire the **consuming** side of a boundary (exchange) edge: if an in-flight
+    /// reporter is registered for the edge targeted at `(operator, input)`,
+    /// attach it to `puller` so every delivered batch records `-count`.
+    ///
+    /// Counterpart to [`wire_inflight_source`](Self::wire_inflight_source); the
+    /// producing `+count` and this consuming `-count` must be wired symmetrically.
+    /// No-op for non-exchange inputs.
+    pub fn wire_inflight_target<T, D, M>(
+        &self,
+        operator: usize,
+        input: usize,
+        puller: &mut (dyn crate::dataflow::channels::pushpull::Pull<T, D, M> + '_),
+    ) where
+        T: crate::progress::timestamp::Timestamp,
+    {
+        if let Some(reporter) = self.inflight_reporter_by_target::<T>(operator, input) {
+            puller.set_inflight_reporter(reporter);
+        }
+    }
+
     /// Take all output pushers for the given port, leaving the slot empty.
     ///
     /// Returns an empty vec if the port index is out of range.

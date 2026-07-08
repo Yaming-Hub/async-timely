@@ -59,10 +59,19 @@ struct InflightBinding<T: Timestamp> {
 
 /// Drain function for a same-scope reporter (`S == T`): identity.
 fn drain_inflight_same<T: Timestamp>(reporter: &(dyn Any + Send + Sync)) -> Vec<(T, i64)> {
-    reporter
-        .downcast_ref::<ProgressReporter<T>>()
-        .map(|r| r.drain())
-        .unwrap_or_default()
+    let reporter = reporter.downcast_ref::<ProgressReporter<T>>();
+    // A registered same-scope reporter must resolve to `ProgressReporter<T>`. A
+    // failed downcast would silently drop the in-flight message (yielding no
+    // updates), making an outstanding message invisible again and silently
+    // reintroducing the data-loss bug this accounting exists to prevent
+    // (#277). Fail loudly in debug/tests instead of dropping data.
+    debug_assert!(
+        reporter.is_some(),
+        "in-flight reporter failed to downcast to ProgressReporter<{}>; \
+         reporter type does not match the registered timestamp type",
+        std::any::type_name::<T>(),
+    );
+    reporter.map(|r| r.drain()).unwrap_or_default()
 }
 
 /// `fresh` function for a same-scope reporter.
@@ -78,8 +87,19 @@ fn drain_inflight_projected<T: Timestamp, I: Timestamp>(
 where
     crate::order::Product<T, I>: Timestamp,
 {
+    let reporter = reporter.downcast_ref::<ProgressReporter<crate::order::Product<T, I>>>();
+    // A registered loop-body reporter must resolve to
+    // `ProgressReporter<Product<T, I>>`. A failed downcast would silently drop
+    // the projected in-flight message, making an outstanding loop-body exchange
+    // message invisible to the outer epoch and silently reintroducing #277.
+    // Fail loudly in debug/tests instead of dropping data.
+    debug_assert!(
+        reporter.is_some(),
+        "loop-body in-flight reporter failed to downcast to ProgressReporter<{}>; \
+         reporter type does not match the registered loop-body timestamp type",
+        std::any::type_name::<crate::order::Product<T, I>>(),
+    );
     reporter
-        .downcast_ref::<ProgressReporter<crate::order::Product<T, I>>>()
         .map(|r| {
             r.drain()
                 .into_iter()
@@ -569,6 +589,8 @@ impl<T: Timestamp> SubgraphBuilder<T> {
             local_changes_buffer: Vec::new(),
             peers_heard_from: Vec::new(),
             inflight_reporters,
+            #[cfg(debug_assertions)]
+            inflight_net: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -658,6 +680,21 @@ pub struct ProgressTracker<T: Timestamp> {
     /// Loop-body exchanges store a `Product<T, _>` reporter whose drain projects
     /// each time onto the outer epoch `T`.
     inflight_reporters: Vec<(usize, usize, InflightReporterAny, InflightDrainFn<T>)>,
+    /// Debug-only cumulative in-flight net per `(target_op, target_port, time)`,
+    /// used ONLY in single-worker mode to fail fast on the producer/consumer
+    /// symmetry invariant ("every `-n` has a matching `+n`").
+    ///
+    /// In single-worker mode the producing and consuming sides of an exchange
+    /// share one reporter, so a running net that goes negative can only mean a
+    /// `-count` was recorded without its matching `+count` — i.e. a missing
+    /// producer-side wiring (the `iter_var.exchange` class of bug), which drives
+    /// the count negative and hangs. Asserting here turns that silent hang into
+    /// a loud panic in tests. NOT applied in multi-worker mode: there the
+    /// `+count` and `-count` land on different per-worker reporters, so a single
+    /// reporter legitimately goes negative before the peer's `+count` broadcast
+    /// is merged.
+    #[cfg(debug_assertions)]
+    inflight_net: std::collections::BTreeMap<(usize, usize, T), i64>,
 }
 
 /// Per-operator frontier state tracked by the progress tracker.
@@ -977,6 +1014,26 @@ impl<T: Timestamp> ProgressTracker<T> {
         // updates are broadcast just like capability changes.
         for (target_op, target_port, reporter, drain) in &self.inflight_reporters {
             for (time, diff) in drain(reporter.as_ref()) {
+                // Single-worker symmetry fail-fast: a running in-flight net that
+                // goes negative means a `-count` was recorded without a matching
+                // `+count` (a missing producer-side wiring), which hangs the
+                // dataflow. Only sound single-worker, where one reporter carries
+                // both sides; multi-worker splits them across per-worker reporters.
+                #[cfg(debug_assertions)]
+                if !has_channels {
+                    let key = (*target_op, *target_port, time.clone());
+                    let net = self.inflight_net.entry(key).or_insert(0);
+                    *net += diff;
+                    debug_assert!(
+                        *net >= 0,
+                        "in-flight net for target ({}, {}) went negative ({}): a \
+                         `-count` was recorded without a matching `+count`, \
+                         indicating a missing producer-side in-flight wiring",
+                        target_op,
+                        target_port,
+                        *net,
+                    );
+                }
                 self.tracker
                     .update_target(*target_op, *target_port, time.clone(), diff);
                 if has_channels {
@@ -1533,5 +1590,34 @@ mod tests {
             tracker.is_completed(),
             "once the message is consumed, the tracker completes"
         );
+    }
+
+    /// Symmetry invariant: in single-worker mode every `-count` must have a
+    /// matching `+count`. A lone `-count` (the "missing producer-side wiring"
+    /// failure mode that caused the `iter_var.exchange` hang) drives the
+    /// in-flight net negative and must fail fast rather than silently hang.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "went negative")]
+    fn inflight_negative_net_panics_single_worker() {
+        let mut builder = SubgraphBuilder::<u64>::new(1, 1);
+        builder
+            .add_operator(1, "upstream", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
+        builder
+            .add_operator(2, "downstream", 1, 1, PortConnectivity::identity(0u64))
+            .unwrap();
+        builder.add_edge(Location::source(0, 0), Location::target(1, 0));
+        builder.add_edge(Location::source(1, 0), Location::target(2, 0));
+        builder.add_edge(Location::source(2, 0), Location::target(0, 0));
+
+        let mut tracker = builder.build();
+        let inflight = tracker.register_inflight_reporter(2, 0);
+        tracker.initialize().unwrap();
+
+        // A `-count` with no matching `+count`: the net goes negative, which can
+        // only mean a producer-side `+count` was never wired. This must panic.
+        inflight.update(5u64, -1);
+        let _ = tracker.propagate();
     }
 }

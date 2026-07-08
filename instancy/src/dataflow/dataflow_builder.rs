@@ -2245,6 +2245,18 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
     /// # Type Parameters
     /// - `TInner`: The inner timestamp type for the loop (typically `u32`)
     ///
+    /// # Limitations
+    ///
+    /// **Nested `iterate` scopes are not currently supported when the dataflow
+    /// contains an `exchange`.** A doubly-nested loop (calling `iterate` again
+    /// inside a loop body) fails at materialization with
+    /// [`DataflowError::MissingFactory`] as soon as any `exchange` edge is
+    /// present in either the inner or outer loop. The loop-body merge re-indexes
+    /// exchange factory creators with a single-level `inner_edge_offset`, which
+    /// does not compose correctly through a second nesting level. Use a single
+    /// loop scope (flattening nested iteration into one loop) until nested-scope
+    /// exchange edge indexing is fixed.
+    ///
     /// # Example
     /// ```ignore
     /// let result = input.iterate::<u32>("loop", 1u32, |iter_var| {
@@ -2579,11 +2591,11 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     // side's `-count`. Without this the in-flight total goes
                     // negative and the loop never completes. No-op for
                     // non-exchange outputs; mirrors the unary-operator wiring.
-                    if let Some(reporter) =
-                        endpoints.inflight_reporter_by_source::<PT<T, TInner>>(concat_idx, 0)
-                    {
-                        output_pusher.set_inflight_reporter(reporter);
-                    }
+                    endpoints.wire_inflight_source::<PT<T, TInner>, _, _>(
+                        concat_idx,
+                        0,
+                        &mut *output_pusher,
+                    );
 
                     Ok(Box::new(WiredConcatOperator::new(
                         concat_name,
@@ -4081,9 +4093,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
 
                     // Record consumed messages on the exchange pull side, retiring
                     // the in-flight count recorded by the sender's push.
-                    if let Some(reporter) = endpoints.inflight_reporter_by_target::<T>(op_idx, 0) {
-                        input_puller.set_inflight_reporter(reporter);
-                    }
+                    endpoints.wire_inflight_target::<T, _, _>(op_idx, 0, &mut *input_puller);
 
                     let output_pusher: Box<dyn Push<T, D>> = {
                         let pushers: Vec<Box<dyn Push<T, D>>> = endpoints
@@ -4444,9 +4454,7 @@ impl<T: Timestamp, D: Clone + Send + 'static> Pipe<T, D> {
                     // If this output feeds an exchange edge, record produced
                     // messages in flight (no-op for non-exchange outputs; the
                     // tee propagates only to exchange branches).
-                    if let Some(reporter) = endpoints.inflight_reporter_by_source::<T>(op_idx, 0) {
-                        output_pusher.set_inflight_reporter(reporter);
-                    }
+                    endpoints.wire_inflight_source::<T, _, _>(op_idx, 0, &mut *output_pusher);
 
                     Ok(Box::new(WiredUnaryOperator::new(
                         name,
